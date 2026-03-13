@@ -1,0 +1,50 @@
+## Unity generated folders (large, can be regenerated)
+/Library/
+/Temp/
+/Obj/
+/Build/
+/Builds/
+/Logs/
+/UserSettings/
+
+## Unity build artifacts
+/*.apk
+/*.aab
+/*.xcodeproj
+/*.xcworkspace
+/Build*/
+/*_BackUpThisFolder_ButDontShipItWithYourGame/
+/*_BurstDebugInformation_DoNotShip/
+
+## Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+*.csproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.unityproj
+*.pidb
+*.booproj
+*.svd
+*.pdb
+
+## OS generated
+.DS_Store
+Thumbs.db
+
+## Crash and debug
+*.stacktrace
+*.log
+*.dSYM/
+mono_crash.*
+
+## Packages cache
+/Packages/manifest.json.backup
+/Packages/packages-lock.json.backup
+
+## Other
+*.tmp
+*.bak
+*.orig
