@@ -23,6 +23,19 @@ Open the project once in Unity to let it restore everything automatically. Then 
 
 If the project relies on specific speech packages or SDKs, document them here (name + version + link) so that anyone can reproduce the setup.
 
+### 2.1 API Keys & Secrets (IMPORTANT)
+
+- **Never** hard‑code API keys (OpenAI, Wit.ai, Azure, etc.) directly in:
+  - C# scripts (e.g. `AdaptiveOrchestrator.cs`)
+  - Unity scenes (e.g. `SampleScene.unity`)
+  - Any asset or config file that is tracked by git.
+- Instead, always:
+  - Store keys in **environment variables** or in **local config assets/files** that are ignored by git.
+  - Add any local secret/config files to `.gitignore` so they never appear in commits.
+- If you ever accidentally commit a key:
+  - **Immediately rotate/regenerate** the key in the provider’s dashboard.
+  - Remove it from the code and from git history before pushing again (GitHub push protection will help you catch leaks).
+
 ### 3. Cloning the Project
 
 1. **Create a folder** where you want to keep your Unity projects.
