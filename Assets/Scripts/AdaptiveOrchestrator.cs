@@ -21,7 +21,7 @@ public class AdaptiveCommandOrchestrator : MonoBehaviour
 
     // [Header("OpenAI (Testing Only - Do NOT ship keys in Quest APK)")]
     [Tooltip("DO NOT commit or ship real keys. Use server proxy or secure config.")]
-    public string OPENAI_API_KEY = ""; 
+    public string OPENAI_API_KEY = "";
     [Tooltip("Use a model that supports the Responses API and structured outputs, e.g. gpt-4o, gpt-4o-mini. gpt-5.2 is not a valid model name and will cause request failures.")]
     public string model = "gpt-5.2";
     [Range(0f, 1.5f)] public float temperature = 0.2f;
@@ -109,6 +109,26 @@ public class AdaptiveCommandOrchestrator : MonoBehaviour
     public List<GameObject> additionalEnvironmentObjects = new List<GameObject>();
 
     // ============================================================
+    // 4) TRIGGER MODULE (conditional adaptations: "follow me when I move", "keep in FOV when I turn head")
+    // ============================================================
+
+    [Header("Trigger conditions (for conditional commands)")]
+    [Tooltip("Transform used to detect 'user moving' (e.g. Camera Rig / TrackingSpace). Position change above threshold = moving.")]
+    public Transform movementDetectionRig;
+    [Tooltip("Transform used to detect 'user turning head' (e.g. Camera.main or CenterEyeAnchor). Rotation change above threshold = turning.")]
+    public Transform headTurnDetection;
+    [Tooltip("Distance in meters the rig must move over the window to count as 'moving' (walking), not just head/hand jitter.")]
+    public float movementThresholdMeters = 0.2f;
+    [Tooltip("Time window in seconds over which movement is measured.")]
+    public float movementWindowSeconds = 0.6f;
+    [Tooltip("Head rotation change in degrees over the window to count as 'turning head'.")]
+    public float headTurnThresholdDegrees = 20f;
+    [Tooltip("Time window in seconds over which head turn is measured.")]
+    public float headTurnWindowSeconds = 0.4f;
+    [Tooltip("After applying a trigger (e.g. cube follows), wait this many seconds before allowing revert when condition is false. Stops immediate detach when movement is not yet detected.")]
+    public float triggerRevertGracePeriodSeconds = 2f;
+
+    // ============================================================
     // INTERNAL
     // ============================================================
 
@@ -119,6 +139,24 @@ public class AdaptiveCommandOrchestrator : MonoBehaviour
     private IAdaptationProvider _cubeProvider;
     private AdaptationRouter _router;
     private bool _isLoading;
+
+    /// <summary>Condition name (e.g. user_moving, user_turning_head). Evaluated via EvaluateCondition(string); add new types there and in the prompt.</summary>
+    private class TriggerRule
+    {
+        public string Condition;
+        public string Domain;
+        public string Target;
+        public StructuredCommand.Params ParamsWhenTrue;
+        public bool LastConditionValue;
+        /// <summary>Revert (detach) only allowed after this time, so we don't revert immediately after applying.</summary>
+        public float RevertAllowedAfterTime;
+    }
+
+    private readonly List<TriggerRule> _activeTriggerRules = new List<TriggerRule>();
+    private Vector3 _movementRigLastPosition;
+    private float _movementRigLastTime;
+    private Quaternion _headLastRotation;
+    private float _headLastTime;
 
     // ============================================================
     // Persistent UI command memory (history) + hard constraints
@@ -274,6 +312,8 @@ public class AdaptiveCommandOrchestrator : MonoBehaviour
 
     private void LateUpdate()
     {
+        EvaluateAndApplyTriggers();
+
         // Enforce after AUIT / other systems wrote transforms.
         if (auitUiElements == null || auitUiElements.Count == 0) return;
 
@@ -367,6 +407,176 @@ public class AdaptiveCommandOrchestrator : MonoBehaviour
                 }
             }
         }
+    }
+
+    private void EvaluateAndApplyTriggers()
+    {
+        float now = Time.time;
+        for (int i = _activeTriggerRules.Count - 1; i >= 0; i--)
+        {
+            var rule = _activeTriggerRules[i];
+            bool conditionNow = EvaluateCondition(rule.Condition);
+            if (conditionNow == rule.LastConditionValue)
+            {
+                if (conditionNow)
+                    rule.RevertAllowedAfterTime = now + triggerRevertGracePeriodSeconds;
+                continue;
+            }
+            if (conditionNow)
+            {
+                rule.LastConditionValue = true;
+                rule.RevertAllowedAfterTime = now + triggerRevertGracePeriodSeconds;
+                ApplyTriggerStateToTarget(rule, true);
+            }
+            else
+            {
+                if (now < rule.RevertAllowedAfterTime) continue;
+                rule.LastConditionValue = false;
+                ApplyTriggerStateToTarget(rule, false);
+            }
+        }
+    }
+
+    /// <summary>Evaluates a named trigger condition. Add new condition types here and document in the prompt.</summary>
+    private bool EvaluateCondition(string conditionName)
+    {
+        if (string.IsNullOrEmpty(conditionName)) return false;
+        switch (conditionName.Trim().ToLowerInvariant())
+        {
+            case "user_moving": return EvaluateUserMoving();
+            case "user_turning_head": return EvaluateUserTurningHead();
+            default: return false;
+        }
+    }
+
+    private bool EvaluateUserMoving()
+    {
+        Transform rig = movementDetectionRig != null ? movementDetectionRig : (Camera.main != null ? Camera.main.transform : null);
+        if (rig == null) return false;
+        float t = Time.time;
+        if (_movementRigLastTime <= 0f)
+        {
+            _movementRigLastPosition = rig.position;
+            _movementRigLastTime = t;
+            return false;
+        }
+        float dt = t - _movementRigLastTime;
+        float dist = Vector3.Distance(rig.position, _movementRigLastPosition);
+        if (dt >= movementWindowSeconds)
+        {
+            _movementRigLastPosition = rig.position;
+            _movementRigLastTime = t;
+            return dist >= movementThresholdMeters;
+        }
+        return dist >= movementThresholdMeters;
+    }
+
+    private bool EvaluateUserTurningHead()
+    {
+        Transform head = headTurnDetection != null ? headTurnDetection : (Camera.main != null ? Camera.main.transform : null);
+        if (head == null) return false;
+        float t = Time.time;
+        if (_headLastTime <= 0f)
+        {
+            _headLastRotation = head.rotation;
+            _headLastTime = t;
+            return false;
+        }
+        float dt = t - _headLastTime;
+        float ang = Quaternion.Angle(head.rotation, _headLastRotation);
+        if (dt >= headTurnWindowSeconds)
+        {
+            _headLastRotation = head.rotation;
+            _headLastTime = t;
+            return ang >= headTurnThresholdDegrees;
+        }
+        return ang >= headTurnThresholdDegrees;
+    }
+
+    private void ApplyTriggerStateToTarget(TriggerRule rule, bool whenTrue)
+    {
+        if (string.Equals(rule.Domain, "world_object", StringComparison.OrdinalIgnoreCase) && (rule.Target == null || rule.Target.IndexOf("cube", StringComparison.OrdinalIgnoreCase) >= 0))
+        {
+            ApplyTriggerToCube(rule.ParamsWhenTrue, whenTrue);
+            return;
+        }
+        GameObject uiGo = FindTriggerUiTarget(rule.Target);
+        if (uiGo != null)
+            ApplyTriggerToUi(uiGo, rule.ParamsWhenTrue, whenTrue);
+    }
+
+    private GameObject FindTriggerUiTarget(string targetName)
+    {
+        if (auitUiElements == null || auitUiElements.Count == 0) return null;
+        if (string.IsNullOrEmpty(targetName) || string.Equals(targetName, "auto", StringComparison.OrdinalIgnoreCase))
+            return auitUiElements[0];
+        foreach (var go in auitUiElements)
+            if (go != null && go.name.Equals(targetName, StringComparison.OrdinalIgnoreCase))
+                return go;
+        return auitUiElements[0];
+    }
+
+    private void ApplyTriggerToUi(GameObject go, StructuredCommand.Params p, bool whenTrue)
+    {
+        if (go == null) return;
+        var st = GetOrCreateUiState(go);
+        if (st == null) return;
+        Transform t = go.transform;
+
+        if (whenTrue && p != null)
+        {
+            if (!string.IsNullOrWhiteSpace(p.anchor_target))
+            {
+                if (string.Equals(p.anchor_target, "world", StringComparison.OrdinalIgnoreCase))
+                {
+                    st.lockWorldPose = true;
+                    st.lockedWorldPos = t.position;
+                    st.lockedWorldRot = t.rotation;
+                }
+                else if (string.Equals(p.anchor_target, "none", StringComparison.OrdinalIgnoreCase))
+                {
+                    st.lockWorldPose = false;
+                    t.SetParent(null, true);
+                }
+                else
+                {
+                    Transform anchor = null;
+                    if (string.Equals(p.anchor_target, "hand", StringComparison.OrdinalIgnoreCase)) anchor = handAnchor;
+                    else if (string.Equals(p.anchor_target, "torso", StringComparison.OrdinalIgnoreCase)) anchor = torsoAnchor;
+                    else if (string.Equals(p.anchor_target, "head", StringComparison.OrdinalIgnoreCase)) anchor = headAnchor;
+                    if (anchor != null) { st.lockWorldPose = false; t.SetParent(anchor, true); }
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(p.keep_in_view) && string.Equals(p.keep_in_view, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                st.keepInView = true;
+                st.maxGazeAngleDeg = p.keep_in_view_angle_deg > 0 ? p.keep_in_view_angle_deg : defaultKeepInViewAngleDeg;
+            }
+        }
+        else
+        {
+            st.lockWorldPose = false;
+            t.SetParent(null, true);
+            st.keepInView = false;
+        }
+    }
+
+    private void ApplyTriggerToCube(StructuredCommand.Params p, bool whenTrue)
+    {
+        if (cube == null) return;
+        if (whenTrue && p != null && !string.IsNullOrWhiteSpace(p.anchor_target))
+        {
+            if (string.Equals(p.anchor_target, "torso", StringComparison.OrdinalIgnoreCase) && torsoAnchor != null)
+                cube.SetParent(torsoAnchor, true);
+            else if (string.Equals(p.anchor_target, "hand", StringComparison.OrdinalIgnoreCase) && handAnchor != null)
+                cube.SetParent(handAnchor, true);
+            else if (string.Equals(p.anchor_target, "head", StringComparison.OrdinalIgnoreCase) && headAnchor != null)
+                cube.SetParent(headAnchor, true);
+            else if (string.Equals(p.anchor_target, "world", StringComparison.OrdinalIgnoreCase))
+                cube.SetParent(worldAnchor != null ? worldAnchor : null, true);
+        }
+        else
+            cube.SetParent(null, true);
     }
 
     /// <summary>
@@ -805,6 +1015,14 @@ app_action (required) — the app does EXACTLY what you set; no other logic runs
 
 clarify_options (required) — always output this array. When app_action is ""clarify"" and the question has a small set of choices, list them as short labels taken from your own question (e.g. [""Yes"", ""No""], [""menu"", ""cube""], [""table"", ""door"", ""window""]). When ANY follow-up question has clear options, prefer to expose them as buttons via clarify_options so the user can answer with a tap instead of speech. For apply/undo or when there are no explicit choices, use [].
 
+trigger_condition (required) — set to ""none"" for normal one-shot commands. ONLY set ""user_moving"" or ""user_turning_head"" when the user EXPLICITLY says ""when I move"", ""when I walk"", ""when I turn my head"":
+- ""follow me"" / ""stick to me"" / ""anchor to my body"" WITHOUT ""when I move"" -> trigger_condition=""none"", anchor_target=""torso"" (one-shot: follows immediately and stays).
+- ""follow me when I move"" / ""when I walk"" -> trigger_condition=""user_moving"", anchor_target=""torso"".
+- ""user_turning_head"": only for ""when I turn my head"" / ""when I look around"" (e.g. keep in view).
+- ""none"": default for all other commands.
+
+clear_triggers (required) — set to true when the user says: ""stop following me"", ""don't follow me"", ""cube stop following"", ""cancel that"", ""release"", ""stop that"". Set response_text to e.g. ""Stopped following."" The app will clear all conditional trigger rules and revert (release anchor).
+
 Feedback (response_text) — required. The app always shows this to the user. Set it to the right message for the situation. Confidence (0-1) is optional; the app only follows app_action.
 
 Domain and target (critical — wrong domain causes the CUBE command to change the UI or vice versa; only ONE domain per command):
@@ -840,6 +1058,7 @@ Place, put, move, anchor — disambiguate by intent (language is ambiguous; infe
 
 Lock and unlock (anchor_target for cube/UI):
 - Pin here / anchor to world / lock in place -> anchor_target=""world"" (and for UI: lock_world_pose=""true"").
+- Follow me / stick to me / come with me (without ""when I move"") -> trigger_condition=""none"", anchor_target=""torso"" so it follows immediately (one-shot).
 - Follow hand / attach to hand -> anchor_target=""hand"".
 - Follow torso / attach to body/chest -> anchor_target=""torso"".
 - Follow head / attach to head -> anchor_target=""head"".
@@ -969,6 +1188,7 @@ Runtime capabilities (use for target names and available actions):
             if (appAction == "undo")
             {
                 HideClarifyOptions();
+                _activeTriggerRules.Clear();
                 RestoreFromUndo();
                 Log("Undo applied.");
                 PushConversationTurn(userCommand, responseMessage, null);
@@ -990,11 +1210,72 @@ Runtime capabilities (use for target names and available actions):
             HideClarifyOptions();
             PushConversationTurn(userCommand, responseMessage, null);
             SnapshotForUndo();
-            _router.RouteAndApply(cmd);
+
+            if (cmd.clear_triggers)
+            {
+                RevertAndClearAllTriggers();
+                Log("Triggers cleared (stop following / cancel).");
+            }
+            else
+            {
+                string triggerCond = (cmd.trigger_condition ?? "").Trim().ToLowerInvariant();
+                if (triggerCond == "user_moving" || triggerCond == "user_turning_head")
+                {
+                    var rule = new TriggerRule
+                    {
+                        Condition = triggerCond,
+                        Domain = cmd.domain ?? "",
+                        Target = cmd.target ?? "auto",
+                        ParamsWhenTrue = CloneParamsForTrigger(cmd.@params),
+                        LastConditionValue = true,
+                        RevertAllowedAfterTime = Time.time + triggerRevertGracePeriodSeconds
+                    };
+                    _activeTriggerRules.Add(rule);
+                    ApplyTriggerStateToTarget(rule, true);
+                    Log("Trigger rule added (applied immediately): " + triggerCond + " -> " + (rule.ParamsWhenTrue != null ? rule.ParamsWhenTrue.anchor_target ?? "" : ""));
+                }
+                else
+                {
+                    _router.RouteAndApply(cmd);
+                }
+            }
+
             PushCommandHistory(userCommand, cmd);
             Log("Done applying command.");
             HideLoading();
         }
+    }
+
+    private static StructuredCommand.Params CloneParamsForTrigger(StructuredCommand.Params p)
+    {
+        if (p == null) return null;
+        return new StructuredCommand.Params
+        {
+            anchor_target = p.anchor_target,
+            keep_in_view = p.keep_in_view,
+            keep_in_view_angle_deg = p.keep_in_view_angle_deg,
+            lock_world_pose = p.lock_world_pose,
+            unlock_pose = p.unlock_pose,
+            visibility = p.visibility,
+            ui_intent = p.ui_intent
+        };
+    }
+
+    /// <summary>Reverts state for any active trigger, then removes all trigger rules. Called when user says "stop following me" or clear_triggers=true.</summary>
+    private void RevertAndClearAllTriggers()
+    {
+        foreach (var rule in _activeTriggerRules)
+        {
+            if (rule.LastConditionValue)
+                ApplyTriggerStateToTarget(rule, false);
+        }
+        _activeTriggerRules.Clear();
+    }
+
+    /// <summary>Removes all conditional trigger rules (e.g. "follow me when I move"). Call from UI or when the user says "stop that" / "cancel".</summary>
+    public void ClearAllTriggerRules()
+    {
+        RevertAndClearAllTriggers();
     }
 
     private void SetResponseText(string text)
@@ -1146,7 +1427,7 @@ Runtime capabilities (use for target names and available actions):
 @"{
   ""type"": ""object"",
   ""additionalProperties"": false,
-  ""required"": [""raw"", ""domain"", ""target"", ""action"", ""priority"", ""params"", ""response_text"", ""confidence"", ""app_action"", ""clarify_options""],
+  ""required"": [""raw"", ""domain"", ""target"", ""action"", ""priority"", ""params"", ""response_text"", ""confidence"", ""app_action"", ""clarify_options"", ""trigger_condition"", ""clear_triggers""],
   ""properties"": {
     ""raw"": { ""type"": ""string"" },
     ""domain"": { ""type"": ""string"" },
@@ -1157,6 +1438,8 @@ Runtime capabilities (use for target names and available actions):
     ""confidence"": { ""type"": ""number"" },
     ""app_action"": { ""type"": ""string"", ""enum"": [""apply"", ""undo"", ""clarify""] },
     ""clarify_options"": { ""type"": ""array"", ""items"": { ""type"": ""string"" }, ""description"": ""When app_action is clarify and there are choices, list button labels e.g. [Yes, No]; otherwise use []"" },
+    ""trigger_condition"": { ""type"": ""string"", ""enum"": [""none"", ""user_moving"", ""user_turning_head""], ""description"": ""Use none for one-shot (e.g. follow me). Use user_moving/user_turning_head only when user says when I move / when I turn head."" },
+    ""clear_triggers"": { ""type"": ""boolean"", ""description"": ""Set true when user says stop following, don't follow me, cancel that, release, stop that. Clears all conditional trigger rules."" },
     ""params"": {
       ""type"": ""object"",
       ""additionalProperties"": false,
@@ -1295,6 +1578,10 @@ Runtime capabilities (use for target names and available actions):
         public string app_action;
         /// <summary>When app_action is "clarify", optional list of button labels (e.g. ["Yes", "No"], ["menu", "cube"]) so the user can pick by clicking.</summary>
         public string[] clarify_options;
+        /// <summary>When not "none", register a trigger rule: apply this command's params when condition is true (e.g. user_moving, user_turning_head), revert when false.</summary>
+        public string trigger_condition;
+        /// <summary>When true, clear all trigger rules (stop following me, cancel that) and revert state.</summary>
+        public bool clear_triggers;
         public Params @params;
 
         [Serializable]
@@ -1943,6 +2230,7 @@ Runtime capabilities (use for target names and available actions):
             sb.Append(" AUIT adaptation objectives (map to intents/params): AnchorToTarget, AvoidAdaptWhileMoving, Collision, ConstantViewSize, DistanceInterval, FieldOfView, LookTowards, Occlusion, SpatialCoherence, SurfaceMagnetism.");
             sb.Append(" If user doesn't name target, target='auto'. Anchor_target for UI: world/hand/torso/head/none.");
             sb.Append(" Commands are enforced FOR SURE by hard constraints in LateUpdate.");
+            sb.Append(" Optional trigger_condition: 'user_moving' or 'user_turning_head' for conditional rules (e.g. follow when I move, keep in view when I turn head).");
             return sb.ToString();
         }
     }
